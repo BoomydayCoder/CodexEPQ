@@ -115,6 +115,7 @@ def check_transcript(result, expected, variant):
 def measure(name, case, args, temp, env):
     source, data, expected = case
     native = temp / name
+    previous_native = temp / (name + "-previous")
     input_path = temp / (name + ".input")
     input_path.write_bytes(data)
     with input_path.open("rb") as stdin, open(os.devnull, "wb") as sink:
@@ -127,11 +128,16 @@ def measure(name, case, args, temp, env):
             originals["alt_vm"] = args.alternate_original
         commands = {key: [binary, source] for key, binary in originals.items()}
         commands.update({"native": [native], "jit": [args.compiler, source]})
+        if args.previous_compiler:
+            execute([args.previous_compiler, "build", source, "-o", previous_native],
+                    stdin, sink, env, timeout=120)
+            commands.update({"previous_native": [previous_native],
+                             "previous_jit": [args.previous_compiler, source]})
         for key, command in commands.items():
             _, result = execute(command, stdin, subprocess.PIPE, env, timeout=120)
             check_transcript(result, expected, f"{name}/{key}")
         samples = {key + "_wall": [] for key in commands}
-        samples.update({key + "_execution": [] for key in [*originals, "native"]})
+        samples.update({key + "_execution": [] for key in commands})
         timed_env = dict(env, EPQ_TIMING="1")
         for trial in range(-args.warmups, args.trials):
             # Rotate the first engine so a variant doesn't always start a round.
@@ -145,27 +151,30 @@ def measure(name, case, args, temp, env):
                 if trial >= 0:
                     samples[key + "_wall"].append(elapsed)
             for key in reversed(order):
-                if key == "jit":
-                    continue
                 if key in originals:
                     _, run = execute([originals[key], "-t", source], stdin, sink, env)
                     elapsed = execution_time(run.stderr, b"microseconds")
                 else:
-                    _, run = execute([native], stdin, sink, timed_env)
+                    _, run = execute(commands[key], stdin, sink, timed_env)
                     elapsed = execution_time(run.stderr, b"nanoseconds")
                 if trial >= 0:
                     samples[key + "_execution"].append(elapsed)
     samples["build"] = builds
-    return {"source": str(source.relative_to(args.upstream)), "source_sha256": digest(source.read_bytes()),
-            "native_sha256": digest(native.read_bytes()),
-            "input_sha256": digest(data), "stdout_sha256": digest(expected), "stdout_bytes": len(expected),
-            "samples_ns": samples}
+    record = {"source": str(source.relative_to(args.upstream)), "source_sha256": digest(source.read_bytes()),
+              "native_sha256": digest(native.read_bytes()),
+              "input_sha256": digest(data), "stdout_sha256": digest(expected), "stdout_bytes": len(expected),
+              "samples_ns": samples}
+    if args.previous_compiler:
+        record["previous_native_sha256"] = digest(previous_native.read_bytes())
+    return record
 
 
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("upstream", type=Path, help="read-only checkout of BoomydayCoder/EPQ")
     p.add_argument("--compiler", type=Path, required=True, help="new EPQ compiler")
+    p.add_argument("--previous-compiler", type=Path,
+                   help="interleave the previous CodexEPQ compiler and its standalone binaries")
     p.add_argument("--original", type=Path, required=True, help="reference VM built by build_original.py")
     p.add_argument("--original-label", default="Reference VM", help="toolchain label recorded in JSON")
     p.add_argument("--alternate-original", type=Path, help="interleave a second reference VM build")
@@ -182,6 +191,8 @@ def main():
     if args.alternate_original:
         args.alternate_original = args.alternate_original.resolve()
     args.compiler = args.compiler.resolve()
+    if args.previous_compiler:
+        args.previous_compiler = args.previous_compiler.resolve()
     args.upstream = args.upstream.resolve()
     cases = examples(args.upstream)
     if args.only and set(args.only) - cases.keys():
@@ -193,6 +204,8 @@ def main():
               "warmups": args.warmups, "trials": args.trials, "build_trials": args.build_trials, "examples": {}}
     if args.alternate_original:
         report.update(alternate_label=args.alternate_label, alternate_sha256=digest(args.alternate_original.read_bytes()))
+    if args.previous_compiler:
+        report["previous_compiler_sha256"] = digest(args.previous_compiler.read_bytes())
     print("All times are median milliseconds; each speedup uses the primary VM.", flush=True)
     print("Example       VM exec    Native exec  Speedup   VM wall  Native wall  Speedup   JIT wall   Speedup   Build", flush=True)
     with tempfile.TemporaryDirectory(prefix="epq-bench-") as tmp:
@@ -211,8 +224,14 @@ def main():
             if args.alternate_original:
                 print(f"  {args.alternate_label}: {ms['alt_vm_execution']:.3f} ms execution, "
                       f"{ms['alt_vm_wall']:.3f} ms wall", flush=True)
+            if args.previous_compiler:
+                print(f"  Previous / current JIT execution: {ms['previous_jit_execution']:.3f} / "
+                      f"{ms['jit_execution']:.3f} ms; JIT wall: {ms['previous_jit_wall']:.3f} / "
+                      f"{ms['jit_wall']:.3f} ms", flush=True)
     if digest(args.compiler.read_bytes()) != report["compiler_sha256"]:
         raise RuntimeError("EPQ compiler changed during the benchmark; rerun with a stable build")
+    if args.previous_compiler and digest(args.previous_compiler.read_bytes()) != report["previous_compiler_sha256"]:
+        raise RuntimeError("Previous compiler changed during measurement")
     if args.json:
         args.json.write_text(json.dumps(report, indent=2) + "\n")
 
