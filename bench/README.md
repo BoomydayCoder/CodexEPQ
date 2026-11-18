@@ -54,7 +54,7 @@ To try an installed GNU C++ compiler, pass `--cxx /path/to/g++` to `build_origin
 
 ## Results on Apple M5
 
-The 17 November 2026 run used a 24 GiB Apple M5, macOS 26.6 (25G72), SDK 26.5, Apple Clang 21.0.0 (clang-2100.1.1.101), and GNU g++ 16.2.0. Both reference VMs passed the operand-order checks and all four engines produced identical stdout for every workload. The tables give medians in milliseconds. [Raw samples and SHA-256 digests](results.json)
+The 17 November 2026 run used a 24 GiB Apple M5, macOS 26.6 (25G72), SDK 26.5, Apple Clang 21.0.0 (clang-2100.1.1.101), and GNU g++ 16.2.0. Both reference builds passed the operand-order checks and all four variants produced identical stdout for every workload. The tables give medians in milliseconds. The engine and process clocks use independent trials, which accounts for the Clang bubble-sort execution median slightly exceeding its process median. [Raw samples and SHA-256 digests](results.json)
 
 ### Execution inside each engine
 
