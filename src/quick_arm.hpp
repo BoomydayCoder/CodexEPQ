@@ -24,10 +24,11 @@ public:
 
 private:
     friend class Assembler;
-    Image(void* memory, std::size_t length) : memory_(memory), length_(length) {}
+    Image(void* memory, std::size_t length, std::vector<std::size_t> expandedBranches);
     void* instruction(std::size_t byteOffset) const;
     void* memory_;
     std::size_t length_;
+    std::vector<std::size_t> expandedBranches_;
 };
 
 // Each EPQ function receives its run context in x0 and argument array in x1.
@@ -41,6 +42,10 @@ public:
     void epilogue();
     void load(std::size_t slot, unsigned reg);
     void store(unsigned reg, std::size_t slot);
+    // A saved operand has a single consuming read. It can stay in a volatile
+    // register until an intervening call or alternate control path needs memory.
+    void saveTemp(unsigned reg, std::size_t slot);
+    void takeTemp(std::size_t slot, unsigned reg);
     void immediate(unsigned reg, std::uint64_t value);
     void mov(unsigned to, unsigned from);
     void context(unsigned reg);
@@ -51,10 +56,17 @@ public:
     void callHost(const void* function);
     void callRegister(unsigned reg);
     void integer(IntOp op);
+    void addSmallInteger(unsigned reg, int offset);
+    void incrementLocal(std::size_t slot, int offset);
     void knownIntDivide(Label zeroDivisor);
     void knownListLength();
-    void knownListGet(Label outOfBounds);
-    void knownListSet(Label outOfBounds);
+    // Element widths are eight for tagged values, four for signed integers,
+    // one for bytes, and zero for a size-only list (write checks only).
+    void knownListGet(Label outOfBounds, unsigned width = 8);
+    void knownListAddress(Label outOfBounds, unsigned dest);
+    void loadListData(unsigned dest);
+    void uncheckedListAddress(unsigned dest, unsigned data, unsigned taggedIndex);
+    void knownListSet(Label outOfBounds, unsigned width = 8);
     void knownListPop(Label empty);
 
     Label label();
@@ -71,7 +83,8 @@ public:
 private:
     enum class Branch { Jump, Call, Zero, Nonzero, Condition };
     struct Fixup { std::size_t word; Label target; Branch kind; unsigned reg; };
-    void branch(Branch kind, Label target, unsigned reg = 0);
+    void branch(Branch kind, Label target, unsigned reg = 0, bool fatal = false);
+    void spillTemps();
     void checkedListIndex(Label outOfBounds);
     void offsetAddress(unsigned reg, unsigned base, std::size_t index);
     void loadFrom(unsigned reg, unsigned base, std::size_t index);
@@ -81,6 +94,8 @@ private:
     std::vector<Fixup> fixups_;
     std::size_t frameSlots_ = 0;
     unsigned registerSlots_ = 0;
+    static constexpr std::size_t unused = static_cast<std::size_t>(-1);
+    std::size_t temps_[3] = {unused, unused, unused}; // x5, x6, x7
 };
 
 } // namespace epq::arm

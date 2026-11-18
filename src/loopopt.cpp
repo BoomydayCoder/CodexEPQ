@@ -1,8 +1,6 @@
 #include "loopopt.hpp"
 
 namespace epq {
-namespace {
-
 const Node* expression_statement(const Node& statement) {
     const Node* node = &statement;
     while ((node->op == Op::BLK || node->op == Op::SEQ) && node->children.size() == 1)
@@ -10,7 +8,18 @@ const Node* expression_statement(const Node& statement) {
     return node->op == Op::EXP ? &node->children.front() : nullptr;
 }
 
-} // namespace
+bool increments_by_one(const Node& statement, int binding, const Resolution& bindings) {
+    const Node* step = expression_statement(statement);
+    auto counter = [&](const Node& n) {
+        return n.op == Op::ID && bindings.id.at(&n) == binding;
+    };
+    auto one = [](const Node& n) { return n.op == Op::INT && n.number == 1; };
+    if (!step || step->op != Op::SET || !counter(step->children[0])) return false;
+    const Node& add = step->children[1];
+    if (add.op != Op::ADD) return false;
+    const auto& terms = add.children;
+    return (counter(terms[0]) && one(terms[1])) || (one(terms[0]) && counter(terms[1]));
+}
 
 std::optional<FillLoop> match_fill_loop(const Node& loop, const Resolution& bindings,
                                         const Types& types) {
@@ -34,14 +43,7 @@ std::optional<FillLoop> match_fill_loop(const Node& loop, const Resolution& bind
     const auto& bound = test.children[1];
     if (!is_counter(start) || !invariant(bound) || types.expression(bound).kind != Kind::Int) return {};
 
-    const Node* step = expression_statement(c[2]);
-    if (!step || step->op != Op::SET || !is_counter(step->children[0])) return {};
-    const Node& add = step->children[1];
-    if (add.op != Op::ADD) return {};
-    const Node& left = add.children[0];
-    const Node& right = add.children[1];
-    auto is_one = [](const Node& node) { return node.op == Op::INT && node.number == 1; };
-    if (!(is_counter(left) && is_one(right)) && !(is_one(left) && is_counter(right))) return {};
+    if (!increments_by_one(c[2], counter, bindings)) return {};
 
     const Node* body = expression_statement(c[3]);
     if (!body || body->op != Op::APP) return {};

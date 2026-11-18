@@ -21,7 +21,7 @@ build/%.o: src/%.cpp | build
 build/epq_runtime.o: runtime/epq_runtime.cpp | build
 	$(NATIVE_CXX) $(CPPFLAGS) $(NATIVE_FLAGS) -MMD -MP -c $< -o $@
 
-build/runtime.pch: build/runtime/epq_runtime.hpp $(RUNTIME_HEADERS) | build
+build/runtime.pch: build/runtime/epq_dense.hpp $(RUNTIME_HEADERS) | build
 	$(NATIVE_CXX) $(NATIVE_FLAGS) -Ibuild/runtime -x c++-header $< -o $@
 
 build/runtime/%.hpp: runtime/%.hpp | build/runtime
@@ -41,6 +41,7 @@ build build/runtime:
 
 test: epq
 	python3 tests/conformance.py --epq ./epq
+	python3 tests/interactive.py --epq ./epq
 
 clean:
 	$(RM) -r build epq

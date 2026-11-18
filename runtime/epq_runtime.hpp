@@ -68,8 +68,12 @@ struct List {
 
 List* makeList(std::initializer_list<V> items = {});
 List* makeList(const V* items, std::size_t count);
+// Capacity is always in V-sized words, including for compiler-proven packed lists.
+void resizeBacking(List* list, std::int32_t capacity, std::size_t bytesToCopy);
 void grow(List* list);
 std::int32_t fillLoop(List* list, V value, std::int32_t start, std::int32_t bound, bool inclusive);
+std::int32_t copyLoop(List* destination, List* source, std::int32_t start,
+                      std::int32_t bound, bool usesSourceLength);
 
 inline V get(List* list, std::int32_t index) {
     if (std::uint32_t(index) >= std::uint32_t(list->size)) fail("Index out of bounds");
@@ -149,6 +153,9 @@ inline bool less(V a, V b) {
 
 // The emitter provides the legacy printed representation for each literal.
 const char* functionDisplay(std::int32_t id);
+// Apply a small integer linear transformation repeatedly modulo 2^32.
+constexpr unsigned maxAffineDimension = 5;
+void applyAffine(std::uint32_t* state, const std::uint32_t* matrix, unsigned size, std::uint32_t count);
 std::int32_t input();
 void print(V value);
 int run(void (*entry)());

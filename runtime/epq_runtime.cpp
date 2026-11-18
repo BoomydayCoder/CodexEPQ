@@ -1,6 +1,10 @@
 #include "epq_runtime.hpp"
+#include "list_buffers.hpp"
 
 #include <algorithm>
+#include <array>
+#include <atomic>
+#include <cerrno>
 #include <charconv>
 #include <chrono>
 #include <climits>
@@ -8,10 +12,96 @@
 #include <cstdlib>
 #include <cstring>
 #include <new>
+#include <dispatch/dispatch.h>
+#include <unistd.h>
 
 namespace rt {
 
+namespace {
+
+void writeStdout(const char* data, std::size_t bytes) {
+    while (bytes) {
+        const ssize_t written = ::write(STDOUT_FILENO, data, bytes);
+        if (written < 0 && errno == EINTR) continue;
+        if (written <= 0) {
+            std::perror("Cannot write EPQ output");
+            std::_Exit(1);
+        }
+        data += written;
+        bytes -= static_cast<std::size_t>(written);
+    }
+}
+
+// One EPQ thread submits prompts. After a burst of buffered input, a serial
+// output queue can write several at once and keep writing while EPQ computes.
+// Flushing before every kernel read bounds the backlog to one input buffer and
+// ensures a client waiting for a prompt can always supply the next integer.
+class Prompts {
+    std::atomic<unsigned> pending{0};
+    dispatch_queue_t queue = nullptr;
+    unsigned readsInBuffer = 0;
+    bool scheduled = false;
+
+    static void sendPending(void* context) {
+        auto& self = *static_cast<Prompts*>(context);
+        unsigned count = self.pending.exchange(0, std::memory_order_relaxed);
+        static constexpr auto block = [] {
+            std::array<char, 3072> bytes{};
+            for (std::size_t i = 0; i < bytes.size(); i += 3) {
+                bytes[i] = '<';
+                bytes[i + 1] = '<';
+                bytes[i + 2] = ' ';
+            }
+            return bytes;
+        }();
+        while (count) {
+            unsigned batch = std::min(count, static_cast<unsigned>(block.size() / 3));
+            writeStdout(block.data(), batch * 3);
+            count -= batch;
+        }
+    }
+
+public:
+    void submit(bool inputAvailable) {
+        if (!inputAvailable) {
+            flush();
+            writeStdout("<< ", 3);
+            return;
+        }
+        if (!queue && ++readsInBuffer >= 16)
+            queue = dispatch_queue_create("epq.prompts", DISPATCH_QUEUE_SERIAL);
+        if (!queue) {
+            writeStdout("<< ", 3);
+            return;
+        }
+        if (pending.fetch_add(1, std::memory_order_relaxed) == 0)
+            dispatch_async_f(queue, this, sendPending);
+        scheduled = true;
+    }
+
+    void flush() {
+        if (scheduled) {
+            dispatch_sync_f(queue, nullptr, [](void*) {});
+            scheduled = false;
+        }
+    }
+
+    void beforeRead() {
+        flush();
+        readsInBuffer = 0;
+    }
+
+    ~Prompts() {
+        flush();
+        if (queue) dispatch_release(queue);
+    }
+};
+
+Prompts prompts;
+} // namespace
+
 [[noreturn]] void fail(const char* message) {
+    prompts.flush();
     std::fprintf(stderr, "%s\n", message);
     std::exit(1);
 }
@@ -28,6 +118,7 @@ struct Slab {
 
 struct ListPool {
     Slab* last = nullptr;
+    ListBuffers buffers;
 
     List* allocate() {
         if (!last || last->used == 256) {
@@ -43,7 +134,7 @@ struct ListPool {
         while (last) {
             for (unsigned i = 0; i < last->used; ++i) {
                 List& list = last->lists[i];
-                if (list.data != list.small) delete[] list.data;
+                if (list.data != list.small) buffers.releaseAtExit(list.data, list.capacity);
             }
             Slab* previous = last->previous;
             delete last;
@@ -155,6 +246,33 @@ bool whitespace(int c) {
     return c == ' ' || (c >= '\t' && c <= '\r');
 }
 
+class InputBuffer {
+    unsigned char data[16384];
+    std::size_t next = 0;
+    std::size_t end = 0;
+
+public:
+    bool available() const { return next < end; }
+
+    int get() {
+        if (!available()) {
+            prompts.beforeRead();
+            ssize_t count;
+            do { count = ::read(STDIN_FILENO, data, sizeof(data)); }
+            while (count < 0 && errno == EINTR);
+            if (count < 0) fail("Cannot read EPQ input");
+            if (!count) return EOF;
+            next = 0;
+            end = static_cast<std::size_t>(count);
+        }
+        return data[next++];
+    }
+
+    void putBack() { --next; }
+};
+
+InputBuffer inputBuffer;
+
 } // namespace
 
 List* makeList(std::initializer_list<V> items) {
@@ -166,23 +284,34 @@ List* makeList(const V* items, std::size_t count) {
     List* list = pool.allocate();
     list->size = static_cast<std::int32_t>(count);
     list->capacity = std::max(list->size, 2);
-    list->data = list->capacity == 2 ? list->small : new V[list->capacity];
+    list->data = list->small;
+    if (list->capacity > 2) list->data = pool.buffers.acquire(list->capacity);
     if (count) std::memcpy(list->data, items, count * sizeof(V));
     return list;
 }
 
-static void expand(List* list, std::int32_t capacity) {
-    V* data = new V[capacity];
-    std::memcpy(data, list->data, std::size_t(list->size) * sizeof(V));
-    if (list->data != list->small) delete[] list->data;
+void resizeBacking(List* list, std::int32_t capacity, std::size_t bytesToCopy) {
+    V* data = pool.buffers.acquire(capacity);
+    std::memcpy(data, list->data, bytesToCopy);
+    if (list->data != list->small) pool.buffers.release(list->data, list->capacity);
     list->data = data;
     list->capacity = capacity;
+}
+
+static void expand(List* list, std::int32_t capacity) {
+    resizeBacking(list, capacity, std::size_t(list->size) * sizeof(V));
 }
 
 void grow(List* list) {
     if (list->capacity == INT32_MAX) fail("List is too large");
     std::int32_t capacity = list->capacity > INT32_MAX / 2 ? INT32_MAX : list->capacity * 2;
     expand(list, capacity);
+}
+
+static void reserveAppendCapacity(List* list, std::int32_t required) {
+    if (required <= list->capacity) return;
+    const auto doubled = std::min<std::int64_t>(std::int64_t(list->capacity) * 2, INT32_MAX);
+    expand(list, std::max(required, static_cast<std::int32_t>(doubled)));
 }
 
 std::int32_t fillLoop(List* list, V value, std::int32_t start, std::int32_t bound, bool inclusive) {
@@ -194,37 +323,80 @@ std::int32_t fillLoop(List* list, V value, std::int32_t start, std::int32_t boun
     }
     const auto required = std::int64_t(list->size) + trips;
     if (required > INT32_MAX) fail("List is too large");
-    if (required > list->capacity) {
-        const auto doubled = std::min<std::int64_t>(std::int64_t(list->capacity) * 2, INT32_MAX);
-        expand(list, static_cast<std::int32_t>(std::max(doubled, required)));
-    }
+    reserveAppendCapacity(list, static_cast<std::int32_t>(required));
     std::fill_n(list->data + list->size, trips, value);
     list->size = static_cast<std::int32_t>(required);
     return bound + inclusive;
+}
+
+std::int32_t copyLoop(List* dst, List* src, std::int32_t start, std::int32_t bound,
+                      bool usesSourceLength) {
+    const auto end = usesSourceLength ? src->size : bound;
+    if (start >= end) return start;
+    const auto count = std::int64_t(end) - start;
+    const auto required = std::int64_t(dst->size) + count;
+    if (start < 0 || end > src->size || (usesSourceLength && dst == src) || required > INT32_MAX) {
+        // Self-appends can create the next readable element and can extend the
+        // loop's bound. Scalar execution preserves that behavior and errors.
+        while (start < (usesSourceLength ? src->size : bound)) {
+            append(dst, get(src, start));
+            ++start;
+        }
+        return start;
+    }
+    reserveAppendCapacity(dst, static_cast<std::int32_t>(required));
+    // Even if dst == src, the new tail starts after all source elements.
+    std::memcpy(dst->data + dst->size, src->data + start, std::size_t(count) * sizeof(V));
+    dst->size = static_cast<std::int32_t>(required);
+    return end;
+}
+
+void applyAffine(std::uint32_t* state, const std::uint32_t* matrix, unsigned size, std::uint32_t count) {
+    constexpr unsigned cells = maxAffineDimension * maxAffineDimension;
+    if (size == 0 || size > maxAffineDimension) fail("Invalid affine dimension");
+    std::uint32_t power[cells];
+    std::copy_n(matrix, size * size, power);
+    while (count) {
+        if (count & 1u) {
+            std::uint32_t next[maxAffineDimension]{};
+            for (unsigned i = 0; i < size; ++i)
+                for (unsigned j = 0; j < size; ++j)
+                    next[i] += power[i * size + j] * state[j];
+            std::copy_n(next, size, state);
+        }
+        count >>= 1;
+        if (!count) break;
+        std::uint32_t next[cells]{};
+        for (unsigned i = 0; i < size; ++i)
+            for (unsigned k = 0; k < size; ++k)
+                for (unsigned j = 0; j < size; ++j)
+                    next[i * size + j] += power[i * size + k] * power[k * size + j];
+        std::copy_n(next, size * size, power);
+    }
 }
 
 bool listsEqual(const List* left, const List* right) { return equalElements(left, right, nullptr); }
 bool listsLess(const List* left, const List* right) { return compareElements(left, right, nullptr) < 0; }
 
 std::int32_t input() {
-    std::fputs("<< ", stdout);
-    std::fflush(stdout);
+    prompts.submit(inputBuffer.available());
     int c;
-    do { c = getc_unlocked(stdin); } while (whitespace(c));
+    do { c = inputBuffer.get(); } while (whitespace(c));
     bool negative = c == '-';
-    if (negative || c == '+') c = getc_unlocked(stdin);
+    if (negative || c == '+') c = inputBuffer.get();
     if (c < '0' || c > '9') fail("Expected integer input");
     std::uint64_t magnitude = 0;
     do {
         magnitude = magnitude * 10 + unsigned(c - '0');
         if (magnitude > std::uint64_t(INT32_MAX) + negative) fail("Integer input out of range");
-        c = getc_unlocked(stdin);
+        c = inputBuffer.get();
     } while (c >= '0' && c <= '9');
-    if (c != EOF && !whitespace(c)) std::ungetc(c, stdin);
+    if (c != EOF && !whitespace(c)) inputBuffer.putBack();
     return static_cast<std::int32_t>(negative ? -std::int64_t(magnitude) : std::int64_t(magnitude));
 }
 
 void print(V value) {
+    prompts.flush();
     std::fputs(">> ", stdout);
     Printer printer;
     printer.write(value);
@@ -238,12 +410,14 @@ int run(void (*entry)()) {
     if (timing && std::strcmp(timing, "1") == 0) {
         auto start = std::chrono::steady_clock::now();
         entry();
+        prompts.flush();
         std::fflush(stdout);
         auto elapsed = std::chrono::steady_clock::now() - start;
         auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed).count();
         std::fprintf(stderr, "Execution time: %lld nanoseconds\n", static_cast<long long>(ns));
     } else {
         entry();
+        prompts.flush();
     }
     return 0;
 }

@@ -1,9 +1,13 @@
 #include "emit.hpp"
+#include "affine.hpp"
+#include "copyloop.hpp"
 #include "display.hpp"
 #include "loopopt.hpp"
+#include "listlayout.hpp"
 #include "resolve.hpp"
 #include "types.hpp"
 
+#include <algorithm>
 #include <sstream>
 #include <stdexcept>
 #include <vector>
@@ -96,10 +100,13 @@ Text quote(const Text& data) {
 class Generator {
 public:
     explicit Generator(const Node& program)
-        : root(program), res(resolve(root)), types(infer(root, res)) {}
+        : root(program), res(resolve(root)), types(infer(root, res)),
+          layouts(list_layouts(root, res, types)) {}
 
     Text run() {
         line("#include \"epq_runtime.hpp\"");
+        if (std::any_of(layouts.begin(), layouts.end(), [](ListLayout l) { return l != ListLayout::Ordinary; }))
+            line("#include \"epq_dense.hpp\"");
         line("using rt::V;");
         line("using rt::List;");
         line("using std::int32_t;");
@@ -143,7 +150,14 @@ private:
             const auto& b = res.bindings[i];
             if (b.owner != owner || b.global != globals || b.parameter) continue;
             const Text link = globals ? "static " : "";
-            line(link + typeName(types.binding(i).kind) + " " + slot(i) + "{};");
+            Text type = typeName(types.binding(i).kind);
+            switch (layouts[i]) {
+            case ListLayout::Count: type = "rt::ListCount"; break;
+            case ListLayout::Byte: type = "rt::DenseList<uint8_t>"; break;
+            case ListLayout::Int: type = "rt::DenseList<int32_t>"; break;
+            case ListLayout::Ordinary: break;
+            }
+            line(link + type + " " + slot(i) + "{};");
             if (res.needs_init_check.count(i)) line(link + "bool " + flag(i) + " = false;");
         }
     }
@@ -161,6 +175,17 @@ private:
         }
         return "static " + typeName(types.result(f).kind) + " " + functionName(f)
             + "(" + join(params) + ")";
+    }
+    ListLayout layout(const Node& n) const {
+        return n.op == Op::ID ? layouts[res.id.at(&n)] : ListLayout::Ordinary;
+    }
+    Text binding(const Node& n) {
+        int id = res.id.at(&n);
+        if (!res.initialized.count(&n)) {
+            const Text message = res.bindings[id].global ? "Undefined global" : "Undefined local";
+            line("if (!" + flag(id) + ") rt::fail(" + quote(message) + ");");
+        }
+        return slot(id);
     }
     void assign(int id, const Value& value) {
         line(slot(id) + " = " + convert(value, types.binding(id).kind) + ";");
@@ -181,12 +206,8 @@ private:
         case Op::INP: return temp(Kind::Int, "rt::input()");
         case Op::ID: {
             const int id = res.id.at(&n);
-            if (!res.initialized.count(&n)) {
-                const Text message = res.bindings[id].global ? "Undefined global" : "Undefined local";
-                line("if (!" + flag(id) + ") rt::fail(" + quote(message) + ");");
-            }
             // Copy here so a later operand can freely assign the same binding.
-            return temp(kind, convert({types.binding(id).kind, slot(id)}, kind));
+            return temp(kind, convert({types.binding(id).kind, binding(n)}, kind));
         }
         case Op::DEF: return {Kind::Function, std::to_string(res.function.at(&n))};
         case Op::LST: {
@@ -195,6 +216,11 @@ private:
             return temp(Kind::List, "rt::makeList({" + join(items) + "})");
         }
         case Op::IND: {
+            if (layout(c[0]) != ListLayout::Ordinary) {
+                auto base = binding(c[0]);
+                Value index = expr(c[1]);
+                return temp(Kind::Int, base + ".get(" + convert(index, Kind::Int) + ")");
+            }
             Value list = expr(c[0]);
             Value index = expr(c[1]);
             Text read = "rt::get(" + convert(list, Kind::List) + ", " + convert(index, Kind::Int) + ")";
@@ -209,6 +235,16 @@ private:
                 return value;
             }
             const auto& indexed = c[0].children;
+            if (auto storage = layout(indexed[0]); storage != ListLayout::Ordinary) {
+                Text base = binding(indexed[0]);
+                Value index = expr(indexed[1]);
+                Value value = expr(c[1]);
+                if (storage == ListLayout::Count)
+                    line(base + ".check(" + convert(index, Kind::Int) + ");");
+                else
+                    line(base + ".set(" + convert(index, Kind::Int) + ", " + convert(value, Kind::Int) + ");");
+                return value;
+            }
             Value list = expr(indexed.at(0));
             Value index = expr(indexed.at(1));
             Value value = expr(c[1]);
@@ -242,6 +278,7 @@ private:
             return temp(kind, unboxKnown("rt::neg(" + box(arg) + ")", kind));
         }
         case Op::ABS: {
+            if (layout(c[0]) != ListLayout::Ordinary) return temp(Kind::Int, binding(c[0]) + ".size()");
             Value arg = expr(c[0]);
             if (arg.kind == Kind::Int) return temp(Kind::Int, "rt::absolute(" + arg.code + ")");
             if (arg.kind == Kind::List) return temp(Kind::Int, "rt::length(" + arg.code + ")");
@@ -323,6 +360,52 @@ private:
         return temp(kind, unboxKnown(invoke, kind));
     }
 
+    void discard(const Node& n) {
+        const auto& c = n.children;
+        if (n.op == Op::SET && layout(c[0]) != ListLayout::Ordinary) {
+            const int id = res.id.at(&c[0]);
+            enterScope(c[1]);
+            std::vector<Text> items;
+            for (const Node& arg : c[1].children) {
+                Value item = expr(arg);
+                if (layouts[id] != ListLayout::Count) items.push_back(convert(item, Kind::Int));
+            }
+            Text init = layouts[id] == ListLayout::Count ? std::to_string(c[1].children.size())
+                                                         : "{" + join(items) + "}";
+            line(slot(id) + ".reset(" + init + ");");
+            if (res.needs_init_check.count(id)) line(flag(id) + " = true;");
+        } else if (n.op == Op::APP && layout(c[0]) != ListLayout::Ordinary) {
+            Text base = binding(c[0]);
+            Value item = expr(c[1]);
+            if (layout(c[0]) == ListLayout::Count) line(base + ".extend(1);");
+            else line(base + ".append(" + convert(item, Kind::Int) + ");");
+        } else {
+            expr(n);
+        }
+    }
+
+    // The called runtime helper is shared by all generated programs, so
+    // optimizing a recurrence does not require recompiling matrix arithmetic.
+    void affineUpdates(const AffineLoop& a, const Text& trips) {
+        std::size_t size = a.bindings.size() + 1;
+        std::vector<Text> values, coefficients;
+        for (std::size_t i = 0; i < size; ++i) {
+            unsigned row = i + 1 == size ? AffineLoop::limit - 1 : static_cast<unsigned>(i);
+            for (std::size_t j = 0; j < size; ++j) {
+                auto column = j + 1 == size ? AffineLoop::limit - 1 : j;
+                coefficients.push_back(std::to_string(a.matrix[row][column]) + "u");
+            }
+            if (i + 1 == size) values.push_back("1u");
+            else if (a.reads_initial[i]) values.push_back("uint32_t(" + slot(a.bindings[i]) + ")");
+            else values.push_back("0u"); // An assignment precedes the first read.
+        }
+        line("uint32_t state[] = {" + join(values) + "};");
+        line("static constexpr uint32_t matrix[] = {" + join(coefficients) + "};");
+        line("rt::applyAffine(state, matrix, " + std::to_string(size) + ", uint32_t(" + trips + "));");
+        for (std::size_t i = 0; i < a.bindings.size(); ++i)
+            if (a.writes[i]) assign(a.bindings[i], {Kind::Int, "int32_t(state[" + std::to_string(i) + "])"});
+    }
+
     void statement(const Node& n) {
         enterScope(n);
         const auto& c = n.children;
@@ -330,7 +413,7 @@ private:
         case Op::SEQ: case Op::BLK:
             for (const Node& child : c) statement(child);
             break;
-        case Op::EXP: expr(c[0]); break;
+        case Op::EXP: discard(c[0]); break;
         case Op::PRINT: {
             Value value = expr(c[0]);
             line("rt::print(" + box(value) + ");");
@@ -364,14 +447,51 @@ private:
                     Value start = expr(*fill->start_read);
                     Value bound = expr(*fill->bound);
                     open("if (" + start.code + (fill->inclusive ? " <= " : " < ") + bound.code + ")");
-                    Value list = expr(*fill->list);
-                    Value item = expr(*fill->value);
-                    Text invoke = "rt::fillLoop(" + convert(list, Kind::List) + ", " + box(item) + ", "
-                        + start.code + ", " + bound.code + ", " + (fill->inclusive ? "true" : "false") + ")";
-                    assign(fill->counter, {Kind::Int, invoke});
+                    if (auto storage = layout(*fill->list); storage != ListLayout::Ordinary) {
+                        Text base = binding(*fill->list);
+                        Value item = expr(*fill->value);
+                        Text trips = "rt::fillCount(" + start.code + ", " + bound.code + ", "
+                            + (fill->inclusive ? "true" : "false") + ")";
+                        line(base + ".extend(" + trips +
+                             (storage == ListLayout::Count ? "" : ", " + convert(item, Kind::Int)) + ");");
+                        assign(fill->counter, {Kind::Int, bound.code + (fill->inclusive ? " + 1" : "")});
+                    } else {
+                        Value list = expr(*fill->list);
+                        Value item = expr(*fill->value);
+                        Text invoke = "rt::fillLoop(" + convert(list, Kind::List) + ", " + box(item) + ", "
+                            + start.code + ", " + bound.code + ", " + (fill->inclusive ? "true" : "false") + ")";
+                        assign(fill->counter, {Kind::Int, invoke});
+                    }
                     close();
                     break;
                 }
+            }
+            if (auto copy = match_copy_loop(n, res, types);
+                copy && layout(copy->destination) == ListLayout::Ordinary
+                     && layout(copy->source) == ListLayout::Ordinary) {
+                Value start = expr(copy->index);
+                Value bound = expr(copy->bound);
+                open("if (" + start.code + " < " + bound.code + ")");
+                Value dst = expr(copy->destination);
+                Value src = expr(copy->source);
+                Text invoke = "rt::copyLoop(" + dst.code + ", " + src.code + ", " + start.code
+                    + ", " + bound.code + ", " + (copy->uses_source_length ? "true" : "false") + ")";
+                assign(res.id.at(&copy->index), {Kind::Int, invoke});
+                close();
+                break;
+            }
+            auto recurrence = match_affine(n, res, types);
+            if (recurrence) {
+                const auto& test = c[1].children;
+                Value start = expr(test[0]);
+                Value bound = expr(test[1]);
+                Text trips = fresh();
+                line("int64_t " + trips + " = int64_t(" + bound.code + ") - " + start.code + ";");
+                open("if (" + trips + " >= 4096)");
+                affineUpdates(*recurrence, trips);
+                assign(res.id.at(&test[0]), bound);
+                close();
+                open("else");
             }
             open("for (;;)");
             Value test = expr(c[counted ? 1 : 0]);
@@ -379,6 +499,7 @@ private:
             statement(c[counted ? 3 : 1]);
             if (counted) statement(c[2]);
             close();
+            if (recurrence) close();
             break;
         }
         case Op::RNG: {
@@ -437,6 +558,7 @@ private:
     const Node& root;
     Resolution res;
     Types types;
+    std::vector<ListLayout> layouts;
     std::ostringstream output;
     int current = -1;
     int indent = 0;

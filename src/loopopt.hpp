@@ -6,6 +6,9 @@
 
 namespace epq {
 
+const Node* expression_statement(const Node& statement);
+bool increments_by_one(const Node& statement, int binding, const Resolution& bindings);
+
 // Replace repeated, identical appends with one bulk fill. The emitter still
 // executes the initializer and the first comparison before reading list/value.
 struct FillLoop {

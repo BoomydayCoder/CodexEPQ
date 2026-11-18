@@ -89,8 +89,56 @@ def scenario(seed):
     return "\n".join(lines)
 
 
-def source_for(seeds):
-    return (HELPERS + "\n".join(scenario(s) for s in seeds) + "\n"
+def optimizer_scenario(seed, wrapped):
+    """Stress reuse of checked cells under aliasing and mutation in a taken branch."""
+    rng = random.Random(seed)
+    def sub(base, offset):
+        return f"{base}[i+{offset}]"
+
+    # A guard may compare the same location under different names. The branch
+    # then alters the binding, the affine index, or the data at that address.
+    n = rng.randint(4, 8)
+    literals = ",".join(str(rng.randint(-32, 32)) for _ in range(n))
+    lines = [f"trial{seed} := (arg) => {{",
+             f"left := [{literals}]; right := [{literals}]; right[0] := arg;",
+             "audit := []; selected := plus; curr := left; al := right;",
+             "(arg <= 0) ? al := left; (arg >= 0) ? curr := right;",
+             "i := 0; acc := 0; bytevec := [0,2,3]; wide := [10,20,30]; ct := [];"]
+    for _ in range(rng.randint(3, 7)):
+        a, b = rng.choices(("left", "right", "curr", "al"), k=2)
+        x, y = rng.choices(range(n - 1), k=2)
+        first, second = sub(a, x), sub(b, y)
+        mutation = rng.choice((
+            f"exchange({a},i+{x},i+{y});",
+            f"{second} := {first} + 1; {first} := {second};",
+            f"i := 1-i; {first} := {second} - 1;",
+            f"curr := {b}; al := {a}; {sub('curr', x)} := {sub('al', y)};",
+            f"store({a},i+{x},store({b},i+{y},{first}));",
+            f"{second} := bytevec[i] + wide[i]; bytevec[i] := {rng.randrange(256)};",
+        ))
+        op = rng.choice((">", "<", ">=", "<=", "=", "!="))
+        lines.append(f"({first} {op} {second}) ? {{ {mutation} acc := {first}; }} "
+                     f": {{ acc := {second}; }}")
+    # Mutating a list used only for its length must still evaluate its item.
+    lines += [f"ct :+ note(acc); ct[i-i] := note({rng.randint(-9, 9)});",
+              "wide[i] := selected(flip(arg),note(acc)); ct :+ note(wide[i]);",
+              "dest := right; (arg >= 0) ? dest := al;",
+              f"(p := {rng.randrange(3)}; p < {rng.randrange(3, n + 1)}; p := p+1;) @ dest :+ curr[p];"]
+    # Compose equivalent array indices in the modulo-2^32 implementation.
+    # The reference runs the offset-free variant to avoid signed overflow.
+    wrapping_case = wrapped and seed % 3 == 0
+    lines.append(f"q := {2147483647 if wrapping_case else 0};")
+    def q_index(offset):
+        return f"q+2147483647+{offset + 2}" if wrapping_case else f"q+{offset}"
+    x, y = rng.sample(range(n), 2)
+    qx, qy = q_index(x), q_index(y)
+    lines += [f"(left[{qx}] >= al[{qy}]) ? exchange(left,{qx},{qy});",
+              "=> [left,right,al,curr,acc,audit,bytevec[i],wide[i],|ct|]; };"]
+    return "\n".join(lines)
+
+
+def source_for(seeds, generate=scenario):
+    return (HELPERS + "\n".join(generate(s) for s in seeds) + "\n"
             + "\n".join(f">> trial{s}(<<);" for s in seeds) + "\n")
 
 
@@ -106,10 +154,12 @@ def execute(command, stdin):
     return subprocess.run(command, input=stdin, capture_output=True, timeout=30)
 
 
-def fail(source, stdin, message, detail):
+def fail(source, stdin, message, detail, reference_source=None):
     out = Path(tempfile.mkdtemp(prefix="epq-differential-failure-"))
     (out / "program.epq").write_text(source)
     (out / "input.txt").write_bytes(stdin)
+    if reference_source is not None and reference_source != source:
+        (out / "reference.epq").write_text(reference_source)
     raise RuntimeError(f"{message}\n{detail}\nReproducer saved in {out}")
 
 
@@ -160,17 +210,23 @@ def suite(args):
     with tempfile.TemporaryDirectory(prefix="epq-differential-") as work:
         path = Path(work, "program.epq")
         artifact = Path(work, "native")
+        ref_path = Path(work, "reference.epq")
         candidate, original = args.epq.resolve(), args.original.resolve()
         for start in range(args.first, args.first + args.seeds, 8):
             seeds = range(start, min(start + 8, args.first + args.seeds))
-            source = source_for(seeds)
+            if args.family == "optimizer":
+                source = source_for(seeds, lambda seed: optimizer_scenario(seed, True))
+                ref_source = source_for(seeds, lambda seed: optimizer_scenario(seed, False))
+            else:
+                source = ref_source = source_for(seeds)
             path.write_text(source)
+            ref_path.write_text(ref_source)
             engines = engines_for(args.mode, candidate, path, artifact)
             for variant in range(args.inputs):
                 stdin = inputs_for(seeds, variant)
-                ref = execute([original, path], stdin)
+                ref = execute([original, ref_path], stdin)
                 if ref.returncode:
-                    fail(source, stdin, "reference failed", ref.stderr.decode(errors="replace"))
+                    fail(ref_source, stdin, "reference failed", ref.stderr.decode(errors="replace"))
                 if ref.stdout.count(b"<< >> ") != len(seeds):
                     fail(source, stdin, "reference did not finish every scenario", repr(ref.stdout))
                 for label, command in engines.items():
@@ -180,9 +236,16 @@ def suite(args):
                             ref.stdout.decode(errors="replace").splitlines(),
                             got.stdout.decode(errors="replace").splitlines(),
                             fromfile="reference", tofile=label, lineterm="")
-                        fail(source, stdin, f"{label} mismatch in seeds {start}..{seeds[-1]}, "
+                        # Each terminating scenario prints one line. Keep the
+                        # complete batch, which also reproduces type inference.
+                        expected_lines, actual_lines = ref.stdout.splitlines(), got.stdout.splitlines()
+                        first = next((i for i, pair in enumerate(zip(expected_lines, actual_lines))
+                                      if pair[0] != pair[1]), min(len(expected_lines), len(actual_lines)))
+                        suspect = min(first, len(seeds) - 1)
+                        fail(source, stdin, f"{label} {args.family} mismatch near seed {seeds[suspect]} "
+                             f"(input {stdin.split()[suspect].decode()}; batch {start}..{seeds[-1]}), "
                              f"input variant {variant}, exit {got.returncode}",
-                             got.stderr.decode(errors="replace") + "\n".join(diff))
+                             got.stderr.decode(errors="replace") + "\n".join(diff), ref_source)
         if args.upstream:
             edge_examples(args, artifact)
     print(f"{args.seeds} generated scenarios × {args.inputs} inputs passed "
@@ -199,6 +262,8 @@ def main():
     parser.add_argument("--seeds", type=int, default=24, help="number of consecutive seeds")
     parser.add_argument("--inputs", type=int, default=3, help="input variants per seed")
     parser.add_argument("--mode", choices=["source", "build", "both"], default="both")
+    parser.add_argument("--family", choices=["general", "optimizer"], default="general",
+                        help="generate mixed-language scenarios or stress the optimizer's alias and index reasoning")
     try:
         suite(parser.parse_args())
     except (OSError, subprocess.TimeoutExpired, RuntimeError, ValueError) as exc:

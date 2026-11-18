@@ -23,7 +23,7 @@ EPQ
 printf '3\n' | ./epq /tmp/total.epq
 ```
 
-The program prints `<< >> 14` followed by a newline. The first `<< ` is the prompt for the piped input.
+The program prints `<< >> 14` followed by a newline. Each input expression emits a `<< ` prompt, including when input comes from a file or pipe. An interactive caller can wait for the prompt before sending an integer. During long bursts of buffered input, the runtime groups pending prompt writes and drains them before waiting for more input, printing a result, or exiting.
 
 | Command | When to use it |
 | --- | --- |
@@ -65,24 +65,30 @@ Conditions treat zero and an empty list as false. `&` and `|` short-circuit and 
 
 ## Implementation and compatibility
 
-Both execution paths use the same parser, scope resolution, and runtime. The standalone compiler tracks the values and list elements that can reach each expression. Where the type or callee is known, it emits scalar arithmetic, direct calls, and ordinary native control flow that Clang can inline and optimize. It can also turn a loop that appends the same value a known number of times into a single list expansion and fill. Dynamic values fit in one machine word. Lists keep a stable identity as they grow and store their first two elements inline.
+Both compilers resolve names and track which integers, lists and function literals can reach each expression. The JIT emits ARM64 instructions directly, keeps frequently accessed locals in registers, and inlines small functions with a known target. For eligible loops it checks the full index range once, then accesses the list's element array directly. If the guard fails, execution follows the ordinary loop with per-access bounds checks.
+
+The standalone compiler emits C++ with native parameters and return values where their types are known, giving Apple Clang the whole program to optimize. It can also accelerate long counted loops whose body updates a few integers using addition, subtraction and multiplication by constants. It models one iteration as an affine transformation and applies repeated squaring to compute the final values in logarithmically many steps, with EPQ's 32-bit wraparound.
+
+A mutable list normally has a stable address, holds up to two items inline, and stores each value in one tagged machine word. A list with a single initializer and no observable aliases can use a more compact representation. For example, the sieve writes only `0` and `1` into its flag list, so each flag fits in one byte. Its list of primes is only measured for length, so a counter is enough. The compiler also recognizes simple loops that append a repeated value or a contiguous slice. Bounds checks, mutations through aliases, and evaluation of the appended expressions retain their EPQ semantics.
 
 Local variable definitions inside expressions have dedicated storage, so an assignment such as `4 + (x := 7)` preserves both the sum and the new binding. Integer arithmetic wraps to 32 bits on overflow. Decimal literals above 2,147,483,647 saturate at that value, matching the original Windows scanner, and a leading minus is a separate operator. Ordered comparisons preserve the language's operand order across compilers. The upstream grammar also recognizes class and member syntax. Its implementation provides no execution rules for these forms. Evaluating them in CodexEPQ raises a diagnostic.
 
-The runtime keeps list allocations until the program exits. Programs that repeatedly discard lists can use memory proportional to the total number of lists created. Recursive calls use the machine stack. The build reserves a 512 MiB stack for the JIT process and standalone executables, with physical pages allocated as needed.
+The runtime retains ordinary list objects until the program exits. When they grow, shorter element arrays return to a pool for reuse. The pool retains its peak allocation, and programs that repeatedly discard entire lists can use memory proportional to the number created. Recursive calls use the machine stack. The build reserves a 512 MiB stack for the JIT process and standalone executables, with physical pages allocated as needed.
 
 ## Test and benchmark
 
-Run the conformance suite from this checkout. For differential tests, point the scripts at an unmodified clone of the upstream repository. Python 3 is needed for these checks.
+Run the conformance and interactive I/O tests from this checkout. For differential tests, point the scripts at an unmodified clone of the upstream repository. Python 3 is needed for these checks.
 
 ```sh
-python3 tests/conformance.py --epq ./epq
+make test
 git clone https://github.com/BoomydayCoder/EPQ.git ../EPQ &&
     git -C ../EPQ checkout --detach 3253cbc688dd76157cd20be70c7f93b2453ccfbd
 python3 bench/build_original.py ../EPQ -o /tmp/epq-original
 python3 tests/conformance.py --epq ./epq --original /tmp/epq-original
-python3 tests/differential.py --epq ./epq --original /tmp/epq-original
+python3 tests/differential.py --epq ./epq --original /tmp/epq-original --upstream ../EPQ
 python3 bench/measure.py ../EPQ --compiler ./epq --original /tmp/epq-original --json /tmp/epq-results.json
 ```
 
-The benchmark runs the original example files and checks their complete output, including input prompts. Timings cover program execution, process startup, and standalone compilation. The report specifies inputs, compiler settings, baseline adjustments, and per-example speedups. [Benchmark report](bench/README.md) · [Raw timing samples](bench/results.json)
+The differential runner also accepts `--family optimizer` for generated programs that stress list aliasing, function calls, and index arithmetic.
+
+The benchmark checks the complete output of each original example, including input prompts. It times execution inside the engines, source-to-exit wall time, and standalone compilation separately. To time an individual execution, set `EPQ_TIMING=1` when running the JIT or a built program. Its runtime writes elapsed nanoseconds to standard error. The benchmark report includes the inputs, compiler flags, baseline adjustments, and per-example results. [Benchmark report](bench/README.md) · [Raw timing samples](bench/results.json)

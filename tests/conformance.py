@@ -214,6 +214,160 @@ CASES = [
         (counter := 0; counter < 2; counter := 1 + counter;) @ dest :+ [];
         dest[2] :+ 30; >> [dest, counter];
     """, ">> [[[9], [9]], 2]\n>> [[[9], [9]], 8]\n>> [[[9], [9], [30], []], 2]\n"),
+    Case("inline_call_snapshots", """
+        exchange := (left,right,i,j) => {
+            saved := left[i]; left[i] := right[j]; right[j] := saved; => left[i];
+        };
+        log := [];
+        mark := (v) => { log :+ v; => v; };
+        choose := () => { log :+ 3; => exchange; };
+        first := [5,8]; second := [15,18]; active := first;
+        >> choose()(active, (active := second), mark(1), mark(0));
+        >> [first, second, active, log];
+        >> exchange(second, second, 0, 0);
+        >> exchange(first, first, 0, 1);
+        >> [first, second];
+    """, ">> 15\n>> [[5, 15], [8, 18], [8, 18], [1, 0, 3]]\n"
+         ">> 8\n>> 15\n>> [[15, 5], [8, 18]]\n"),
+    Case("nested_inline_calls", """
+        pair := (x,y) => { x := x * 10; => x+y; };
+        invoke := (fn,z) => { => fn(z,1); };
+        choose := () => { >> invoke(pair,6); => pair; };
+        >> choose()(pair(1,2), invoke(pair,3));
+        >> [pair(4,pair(5,6)), pair(pair(1,2),pair(3,4))];
+    """, ">> 61\n>> 151\n>> [96, 154]\n"),
+    Case("repeated_inline_local", """
+        maybe := (flag) => { flag & (saved := 42); => saved; };
+        >> maybe(1); >> maybe(0);
+    """, ">> 42\n", corrected=True, error=True),
+    Case("nonescaping_integer_lists", """
+        measure := (n) => {
+            flags := [255,0];
+            (i := 0; i < n; i := i+1;) @ flags :+ 1;
+            flags[1] := 255;
+            signed := [0,-1]; signed :+ 256; signed[0] := -2147483647-1;
+            (pass := 0; pass < 2; pass := pass+1;) @ {
+                local := []; local :+ pass; >> [|local|, local[0]];
+            }
+            => [|flags|, flags[0], flags[1], flags[|flags|-1],
+                signed[0], signed[1], signed[2]];
+        };
+        >> measure(0); >> measure(9);
+    """, ">> [1, 0]\n>> [1, 1]\n>> [2, 255, 255, 255, -2147483648, -1, 256]\n"
+         ">> [1, 0]\n>> [1, 1]\n>> [11, 255, 255, 1, -2147483648, -1, 256]\n"),
+    Case("length_only_side_effects", """
+        calls := 0;
+        next := () => { calls := calls + 1; => calls; };
+        sizes := (n) => {
+            items := [next()]; (i := 0; i < n; i := i+1;) @ items :+ next();
+            items[<<] := next();
+            => |items|;
+        };
+        >> sizes(3); >> calls; >> sizes(0); >> calls;
+    """, "<< >> 4\n>> 5\n<< >> 1\n>> 7\n", "3 0\n"),
+    Case("packed_global_rebinding", """
+        // This unreachable operand declares the name in the upstream global scan.
+        0 & (arr := [99]).unused;
+        reset := (n) => { arr := [n]; => 0; };
+        reset(3); arr[reset(7)] := 11; >> arr[0];
+        reset(3); arr[0] := reset(9); >> arr[0];
+        reset(3); >> arr[reset(5)]; >> arr[0];
+        reset(3); arr :+ reset(8); >> [|arr|, arr[0]];
+    """, ">> 7\n>> 9\n>> 3\n>> 5\n>> [1, 8]\n"),
+    Case("guarded_index_storage", """
+        f := (pair, alias) => {
+            bytes := [9,3]; wide := [-9,3];
+            (bytes[0] > bytes[1]) ? bytes[1] := 255;
+            (wide[0] < wide[1]) ? wide[1] := wide[0] * -1;
+            i := 0; j := 1;
+            (pair[i] > alias[j]) ? {
+                bytes[0] := 11;
+                pair[j] := 17; saved := alias[j]; pair[i] := saved;
+                i := 1; pair[i] := 19;
+            }
+            => [bytes[0],bytes[1],wide[0],wide[1],pair];
+        };
+        xs := [5,2]; >> f(xs,xs);
+    """, ">> [11, 255, -9, 9, [17, 19]]\n"),
+    Case("guarded_wrapped_index", """
+        adjust := (a,x) => {
+            (a[x+2147483647+3] > a[x-2147483647]) ? {
+                a[x-2147483647+1] := a[x-2147483647];
+            }
+            => a;
+        };
+        >> adjust([10,80],2147483647);
+    """, ">> [10, 10]\n", corrected=True),
+    Case("discarded_list_store_bounds", """
+        emit := (v) => { >> v; => v; };
+        f := (i) => { items := [0,1]; items[i] := emit(7); => |items|; };
+        >> f(1); >> f(2);
+    """, ">> 7\n>> 2\n>> 7\n", error=True),
+    Case("slice_copy_alias_and_counter", """
+        xs := [4,9]; ys := xs; idx := 0;
+        (idx := 0; idx < 5; idx := idx+1;) @ ys :+ xs[idx];
+        >> [xs, idx];
+        rows := [[1],[2],[3]]; out := [];
+        idx := 1; (idx < |rows|) @ { out :+ rows[idx]; idx := idx+1; }
+        rows[1] :+ 7; >> [out, idx];
+        (idx := 9; idx < 2; idx := idx+1;) @ future :+ rows[idx];
+        future := []; >> idx;
+        src := [0,1,2,3]; (idx := 0; idx <= 2; idx := idx+1;) @ out :+ src[idx];
+        >> [out, idx];
+    """, ">> [[4, 9, 4, 9, 4, 9, 4], 5]\n>> [[[2, 7], [3]], 3]\n>> 9\n"
+         ">> [[[2, 7], [3], 0, 1, 2], 3]\n"),
+    Case("slice_copy_negative_index", """
+        src := [7,8]; out := []; >> |out|;
+        (i := -1; i < 1; i := i+1;) @ out :+ src[i];
+        >> |out|;
+    """, ">> 0\n", error=True),
+    Case("counted_index_guards", """
+        shift := (a,n) => {
+            (i := 1; i < n-1; i := i+1;) @ a[i-1] := a[i]+a[i+1];
+            => a;
+        };
+        >> shift([3,7,11,13,17],5);
+        choose := (a,b,n) => {
+            res := 0; (i := 0; i < n; i := i+1;) @ {
+                (i = 1) ? a := b;
+                res := res + a[i];
+            }
+            => res;
+        };
+        >> choose([10,20,30], [1,2,3], 3);
+        empty := (n) => {
+            res := 0; (i := 0; i < n; i := i+1;) @ res := res+later[i];
+            => res;
+        };
+        >> empty(0); later := [17,2]; >> empty(2);
+        first := (a,n) => {
+            (i := 0; i < n; i := i+1;) @ { x := a[i+1]; (i = 0) ? => x; }
+            => 0;
+        };
+        >> first([3,7],5000);
+    """, ">> [18, 24, 30, 13, 17]\n>> 15\n>> 0\n>> 19\n>> 7\n"),
+    Case("affine_loop_dependencies", """
+        turn := 0; a := 1; b := 2; total := 0; saved := 0;
+        (turn := 3; turn < 5004; turn := turn+1;) @ {
+            saved := a; a := b; b := saved; total := total+a;
+        }
+        >> [turn,a,b,total,saved];
+        bound := 10000;
+        (turn := 0; turn < bound; turn := turn+1;) @ bound := bound-1;
+        >> [turn,bound];
+        total := 0;
+        (turn := 0; turn < 10000; turn := turn+1;) @ { turn := turn+1; total := total+1; }
+        >> [turn,total];
+    """, ">> [5004, 2, 1, 7502, 1]\n>> [5000, 5000]\n>> [10000, 5000]\n"),
+    Case("affine_loop_uninitialized", """
+        0 & (missing := 1);
+        accumulate := (n) => {
+            value := 7;
+            (i := 0; i < n; i := i+1;) @ value := value+missing;
+            => value;
+        };
+        >> accumulate(0); >> accumulate(5000);
+    """, ">> 7\n", error=True),
     Case("deep_non_tail_recursion", """
         f := (n) => {
             (n = 0) ? => [0,0];
